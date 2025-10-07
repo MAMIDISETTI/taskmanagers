@@ -35,13 +35,18 @@ app.use(
       // Allow requests with no origin (like mobile apps or curl requests)
       if (!origin) return callback(null, true);
       
-      // Allow localhost for development
+      // Allow localhost for development (including port 5173)
       if (origin.includes('localhost') || origin.includes('127.0.0.1')) {
         return callback(null, true);
       }
       
       // Allow Vercel domains
       if (origin.includes('.vercel.app')) {
+        return callback(null, true);
+      }
+      
+      // Allow Render domains
+      if (origin.includes('.onrender.com')) {
         return callback(null, true);
       }
       
