@@ -13,7 +13,46 @@ const getResults = async (req, res) => {
     
     // If user is a trainee, automatically filter by their author_id
     if (req.user.role === 'trainee') {
-      query.author_id = req.user.author_id;
+      // Get the trainee's author_id - check both User and UserNew models
+      let traineeAuthorId = req.user.author_id;
+      
+      // Always verify author_id from database to ensure accuracy
+      const traineeUser = await User.findById(req.user.id).select('author_id');
+      if (traineeUser && traineeUser.author_id) {
+        traineeAuthorId = traineeUser.author_id;
+      } else {
+        // Try UserNew model
+        const UserNew = require('../models/UserNew');
+        const traineeUserNew = await UserNew.findById(req.user.id).select('author_id');
+        if (traineeUserNew && traineeUserNew.author_id) {
+          traineeAuthorId = traineeUserNew.author_id;
+        }
+      }
+      
+      if (traineeAuthorId) {
+        // Use $in to match results with this author_id (in case there are variations)
+        query.author_id = traineeAuthorId;
+      } else {
+        // If no author_id found, try to find by email or name as fallback
+        const traineeUser = await User.findById(req.user.id).select('email name');
+        const traineeUserNew = traineeUser ? null : await (require('../models/UserNew')).findById(req.user.id).select('email name');
+        const traineeData = traineeUser || traineeUserNew;
+        
+        if (traineeData && traineeData.email) {
+          // Try to find results by email as fallback
+          query.email = traineeData.email;
+          delete query.author_id; // Remove author_id from query if using email
+        } else {
+          // If no author_id or email found, return empty results
+          return res.json({
+            success: true,
+            results: [],
+            totalPages: 0,
+            currentPage: page,
+            total: 0
+          });
+        }
+      }
     } else if (authorId) {
       // For other roles, use the provided authorId if available
       query.author_id = authorId;
@@ -42,17 +81,43 @@ const getResults = async (req, res) => {
     const allResults = await Result.find({}).select('exam_type author_id trainee_name score').limit(5);
     // // Get all unique exam types in the database
     const uniqueExamTypes = await Result.distinct('exam_type');
+    
+    // For trainees, remove limit to show all their results
+    const queryLimit = req.user.role === 'trainee' ? 1000 : (limit * 1);
+    const querySkip = req.user.role === 'trainee' ? 0 : ((page - 1) * limit);
+    
     const results = await Result.find(query)
       .sort({ uploaded_at: -1 })
-      .limit(limit * 1)
-      .skip((page - 1) * limit);
+      .limit(queryLimit)
+      .skip(querySkip);
+
+    // Debug logging for trainee queries
+    if (req.user.role === 'trainee') {
+      console.log('Trainee Results Query Debug:');
+      console.log('- Trainee ID:', req.user.id);
+      console.log('- Trainee author_id:', query.author_id);
+      console.log('- Query:', JSON.stringify(query, null, 2));
+      console.log('- Results found:', results.length);
+      if (results.length > 0) {
+        console.log('- Sample result:', {
+          exam_type: results[0].exam_type,
+          author_id: results[0].author_id,
+          trainee_name: results[0].trainee_name
+        });
+      }
+    }
 
     // Manually populate uploaded_by and trainer information using author_id
     const populatedResults = await Promise.all(results.map(async (result) => {
       const uploadedBy = await User.findOne({ author_id: result.uploaded_by }).select('name email author_id');
       
-      // Get trainee information to find their assigned trainer
-      const trainee = await User.findOne({ author_id: result.author_id }).select('assignedTrainer name email');
+      // Get trainee information to find their assigned trainer - check both User and UserNew models
+      let trainee = await User.findOne({ author_id: result.author_id }).select('assignedTrainer name email');
+      if (!trainee) {
+        const UserNew = require('../models/UserNew');
+        trainee = await UserNew.findOne({ author_id: result.author_id }).select('assignedTrainer name email');
+      }
+      
       let trainerName = result.trainer_name || 'N/A';
       
       // If no trainer_name is set and trainee has an assigned trainer, get trainer name
@@ -214,14 +279,26 @@ const bulkUploadResults = async (req, res) => {
           continue;
         }
 
-         // Find user by author_id and validate role
+         // Find user by author_id and validate role - check both User and UserNew models
          let user = await User.findOne({ author_id: resultData.author_id });
          
-         // If not found and author_id looks truncated, try partial match
+         // If not found in User model, try UserNew model
+         if (!user) {
+           const UserNew = require('../models/UserNew');
+           user = await UserNew.findOne({ author_id: resultData.author_id });
+         }
+         
+         // If not found and author_id looks truncated, try partial match in both models
          if (!user && resultData.author_id && resultData.author_id.length < 36) {
            user = await User.findOne({ 
              author_id: { $regex: `^${resultData.author_id}`, $options: 'i' } 
            });
+           if (!user) {
+             const UserNew = require('../models/UserNew');
+             user = await UserNew.findOne({ 
+               author_id: { $regex: `^${resultData.author_id}`, $options: 'i' } 
+             });
+           }
          }
          
          if (!user) {
@@ -346,20 +423,30 @@ const bulkUploadResults = async (req, res) => {
            };
 
            try {
-             const updatedUser = await User.findByIdAndUpdate(
+             // Try to update in User model first
+             let updatedUser = await User.findByIdAndUpdate(
                user._id,
                { $push: { fortnightExams: examData } },
                { new: true }
              );
              
+             // If not found in User model, try UserNew model
+             if (!updatedUser) {
+               const UserNew = require('../models/UserNew');
+               updatedUser = await UserNew.findByIdAndUpdate(
+                 user._id,
+                 { $push: { fortnightExams: examData } },
+                 { new: true }
+               );
+             }
+             
              if (updatedUser) {
                // Success - user updated
              } else {
-              
+               console.error(`Failed to update fortnightExams for user ${user._id}`);
              }
            } catch (updateError) {
-            
-            
+             console.error(`Error updating fortnightExams for user ${user._id}:`, updateError);
            }
          } else if (isDailyExam) {
            // Add to dailyQuizzes array
@@ -375,11 +462,22 @@ const bulkUploadResults = async (req, res) => {
              uploaded_by: req.user.id
            };
 
-           await User.findByIdAndUpdate(
+           // Try to update in User model first
+           let updatedUser = await User.findByIdAndUpdate(
              user._id,
              { $push: { dailyQuizzes: examData } },
              { new: true }
            );
+           
+           // If not found in User model, try UserNew model
+           if (!updatedUser) {
+             const UserNew = require('../models/UserNew');
+             await UserNew.findByIdAndUpdate(
+               user._id,
+               { $push: { dailyQuizzes: examData } },
+               { new: true }
+             );
+           }
 
          } else if (isCourseExam) {
            // Add to courseLevelExams array
@@ -395,11 +493,22 @@ const bulkUploadResults = async (req, res) => {
              uploaded_by: req.user.id
            };
 
-           await User.findByIdAndUpdate(
+           // Try to update in User model first
+           let updatedUser = await User.findByIdAndUpdate(
              user._id,
              { $push: { courseLevelExams: examData } },
              { new: true }
            );
+           
+           // If not found in User model, try UserNew model
+           if (!updatedUser) {
+             const UserNew = require('../models/UserNew');
+             await UserNew.findByIdAndUpdate(
+               user._id,
+               { $push: { courseLevelExams: examData } },
+               { new: true }
+             );
+           }
 
          } else {
            // Fallback: Add to appropriate array based on request examType

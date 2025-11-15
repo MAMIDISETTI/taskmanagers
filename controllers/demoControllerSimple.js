@@ -317,9 +317,16 @@ const updateDemo = async (req, res) => {
     }
     
     // Find the demo in the trainee's demo_managements_details array
-    const trainee = await User.findOne({ 
+    // Check both User and UserNew models
+    let trainee = await User.findOne({ 
       'demo_managements_details.id': id 
     });
+    
+    if (!trainee) {
+      trainee = await UserNew.findOne({ 
+        'demo_managements_details.id': id 
+      });
+    }
     
     if (!trainee) {
       return res.status(404).json({

@@ -9,8 +9,17 @@ const TraineeDayPlanSchema = new mongoose.Schema(
       required: true 
     },
     
+    // Day plan title
+    title: { type: String, required: false, default: "" },
+    
     // Day plan date
     date: { type: Date, required: true },
+    
+    // Topics (new format with nested structure)
+    topics: {
+      type: mongoose.Schema.Types.Mixed,
+      default: []
+    },
     
     // Tasks submitted by trainee
     tasks: [{
@@ -36,7 +45,7 @@ const TraineeDayPlanSchema = new mongoose.Schema(
     // Status tracking
     status: { 
       type: String, 
-      enum: ["draft", "in_progress", "completed", "rejected", "pending"], 
+      enum: ["draft", "in_progress", "approved", "completed", "rejected", "pending"], 
       default: "draft" 
     },
     

@@ -1,5 +1,6 @@
 const TraineeDayPlan = require("../models/TraineeDayPlan");
 const User = require("../models/User");
+const Joiner = require("../models/Joiner");
 const Notification = require("../models/Notification");
 
 // @desc    Create a new trainee day plan submission
@@ -19,7 +20,7 @@ const createTraineeDayPlan = async (req, res) => {
       });
     }
 
-    const { date, tasks, checkboxes, status = "submitted" } = req.body;
+    const { title, date, tasks, topics, checkboxes, status = "submitted" } = req.body;
     
     // Check if trainee already has a day plan for this date
     const existingPlan = await TraineeDayPlan.findOne({
@@ -36,11 +37,13 @@ const createTraineeDayPlan = async (req, res) => {
     // Create the trainee day plan
     const dayPlanData = {
       trainee: actualTraineeId,
+      title: title || "", // Include title
       date: new Date(date),
       tasks: (tasks || []).map(task => ({
         ...task,
         id: task.id || `task_${Date.now()}_${Math.random().toString(36).substr(2, 9)}` // Ensure task has ID
       })),
+      topics: topics || [], // Include topics
       checkboxes: checkboxes || {},
       status: status === "submitted" ? "in_progress" : status,
       submittedAt: status === "submitted" ? new Date() : null,
@@ -114,9 +117,20 @@ const getTraineeDayPlans = async (req, res) => {
       if (stats === 'true') {
         // Return statistics for master trainer
         const totalPlans = await TraineeDayPlan.countDocuments({});
-        const publishedPlans = await TraineeDayPlan.countDocuments({ status: 'completed' }); // Changed from 'approved' to 'completed'
-        const completedPlans = await TraineeDayPlan.countDocuments({ status: 'completed' });
-        const draftPlans = await TraineeDayPlan.countDocuments({ status: 'draft' });
+        // 'published' means plans approved by trainers (status: 'approved')
+        const publishedPlans = await TraineeDayPlan.countDocuments({ status: 'approved' });
+        // 'completed' means plans with EOD approved (status: 'completed' AND eodUpdate.status: 'approved')
+        const completedPlans = await TraineeDayPlan.countDocuments({ 
+          status: 'completed',
+          'eodUpdate.status': 'approved'
+        });
+        // 'draft' means plans that are draft or in_progress (not yet approved)
+        const draftPlans = await TraineeDayPlan.countDocuments({ 
+          $or: [
+            { status: 'draft' },
+            { status: 'in_progress' }
+          ]
+        });
 
         return res.json({
           success: true,
@@ -162,12 +176,53 @@ const getTraineeDayPlans = async (req, res) => {
 
       // Return all trainee day plans for master trainer
       const dayPlans = await TraineeDayPlan.find({})
-        .populate('trainee', 'name email employeeId department')
+        .populate({
+          path: 'trainee',
+          select: 'name email employeeId department',
+          model: 'User'
+        })
         .sort({ date: -1, submittedAt: -1 });
+
+      // Ensure trainee data is properly included and get correct employee ID from Joiner if needed
+      const formattedDayPlans = await Promise.all(dayPlans.map(async (plan) => {
+        const planObj = plan.toObject ? plan.toObject() : plan;
+        let trainee = planObj.trainee || null;
+        
+        // If trainee exists but employeeId is in wrong format (starts with EMP_), try to get from Joiner
+        if (trainee && trainee.employeeId && trainee.employeeId.startsWith('EMP_')) {
+          try {
+            const joiner = await Joiner.findOne({
+              $or: [
+                { candidate_personal_mail_id: trainee.email },
+                { email: trainee.email },
+                { name: trainee.name }
+              ]
+            }).select('employeeId employee_id');
+            
+            if (joiner && (joiner.employeeId || joiner.employee_id)) {
+              // Use the employee ID from Joiner if it exists and is not in EMP_ format
+              const joinerEmpId = joiner.employeeId || joiner.employee_id;
+              if (joinerEmpId && !joinerEmpId.startsWith('EMP_')) {
+                trainee = {
+                  ...trainee,
+                  employeeId: joinerEmpId
+                };
+              }
+            }
+          } catch (err) {
+            console.error('Error fetching joiner for employee ID:', err);
+          }
+        }
+        
+        return {
+          ...planObj,
+          trainee: trainee
+        };
+      }));
 
       return res.json({
         success: true,
-        dayPlans
+        dayPlans: formattedDayPlans
       });
     }
     
@@ -418,7 +473,9 @@ const reviewTraineeDayPlan = async (req, res) => {
       });
     }
 
-    dayPlan.status = status === "approved" ? "completed" : "rejected";
+    // When trainer approves initial day plan, set status to "approved" (not "completed")
+    // "completed" status is only for after EOD approval
+    dayPlan.status = status === "approved" ? "approved" : "rejected";
     dayPlan.reviewedBy = trainerId;
     dayPlan.reviewedAt = new Date();
     dayPlan.reviewComments = reviewComments || "";
@@ -534,6 +591,13 @@ const submitEodUpdate = async (req, res) => {
     if (!dayPlan) {
       return res.status(404).json({ 
         message: "No day plan found for today. Please submit a day plan first." 
+      });
+    }
+
+    // Check if day plan is approved (trainee can only submit EOD after trainer approves)
+    if (dayPlan.status !== 'approved') {
+      return res.status(400).json({ 
+        message: "Day plan must be approved by trainer before submitting EOD update." 
       });
     }
 
