@@ -189,36 +189,39 @@ const bulkUploadJoiners = async (req, res) => {
           return value;
         };
 
+        // Clean and normalize email
+        const email = (joinerData.candidate_personal_mail_id || '').toString().trim().toLowerCase();
+        
         // Map the data to our schema based on your exact data structure
         const mappedData = {
           // Required fields with proper fallbacks
-          name: joinerData.candidate_name || 'Unknown',
-          email: joinerData.candidate_personal_mail_id || 'unknown@example.com',
-          phone: joinerData.phone_number ? joinerData.phone_number.toString() : '0000000000',
-          department: nullIfEmpty(joinerData.top_department_name_as_per_darwinbox) || 'OTHERS',
+          name: (joinerData.candidate_name || 'Unknown').trim(),
+          email: email,
+          phone: null, // Will be set after phone validation
+          department: 'OTHERS', // Will be validated later
           role: 'trainee', // Default role since role_type is "Full-time" which is not in our enum
           joiningDate: joinerData.date_of_joining ? new Date(joinerData.date_of_joining) : new Date(),
           
           // Optional fields with proper null handling
-          candidate_name: nullIfEmpty(joinerData.candidate_name),
-          candidate_personal_mail_id: nullIfEmpty(joinerData.candidate_personal_mail_id),
-          phone_number: joinerData.phone_number ? joinerData.phone_number.toString() : null,
-          top_department_name_as_per_darwinbox: nullIfEmpty(joinerData.top_department_name_as_per_darwinbox),
-          department_name_as_per_darwinbox: nullIfEmpty(joinerData.department_name_as_per_darwinbox),
+          candidate_name: nullIfEmpty(joinerData.candidate_name)?.trim(),
+          candidate_personal_mail_id: email,
+          phone_number: null, // Will be set after phone validation
+          top_department_name_as_per_darwinbox: nullIfEmpty(joinerData.top_department_name_as_per_darwinbox)?.trim(),
+          department_name_as_per_darwinbox: nullIfEmpty(joinerData.department_name_as_per_darwinbox)?.trim(),
           date_of_joining: joinerData.date_of_joining ? new Date(joinerData.date_of_joining) : null,
-          joining_status: nullIfEmpty(joinerData.joining_status)?.toLowerCase() || 'pending',
-          role_type: nullIfEmpty(joinerData.role_type),
-          role_assign: nullIfEmpty(joinerData.role_assign) || 'OTHER',
-          qualification: nullIfEmpty(joinerData.qualification),
+          joining_status: nullIfEmpty(joinerData.joining_status)?.toLowerCase().trim() || 'pending',
+          role_type: nullIfEmpty(joinerData.role_type)?.trim(),
+          role_assign: (nullIfEmpty(joinerData.role_assign)?.trim() || 'OTHER').toUpperCase(),
+          qualification: nullIfEmpty(joinerData.qualification)?.trim(),
           author_id: author_id, // Generated UUID
-          employeeId: nullIfEmpty(joinerData.employee_id),
+          employeeId: nullIfEmpty(joinerData.employee_id)?.trim(),
           genre: nullIfEmpty(joinerData.genre) ? 
-            nullIfEmpty(joinerData.genre).charAt(0).toUpperCase() + nullIfEmpty(joinerData.genre).slice(1).toLowerCase() : 
+            nullIfEmpty(joinerData.genre).trim().charAt(0).toUpperCase() + nullIfEmpty(joinerData.genre).trim().slice(1).toLowerCase() : 
             null,
           status: 'pending',
           accountCreated: false,
           accountCreatedAt: null,
-          createdBy: req.user?.id ? new mongoose.Types.ObjectId(req.user.id) : new mongoose.Types.ObjectId(),
+          createdBy: req.user?.id ? new mongoose.Types.ObjectId(req.user.id) : null,
           
           // Onboarding checklist
           onboardingChecklist: {
@@ -229,6 +232,20 @@ const bulkUploadJoiners = async (req, res) => {
             documentsSubmitted: false
           }
         };
+        
+        // Set department - must be one of the enum values
+        const deptValue = nullIfEmpty(joinerData.top_department_name_as_per_darwinbox)?.trim();
+        if (deptValue) {
+          // Try to match department name to enum values
+          const deptUpper = deptValue.toUpperCase();
+          if (['IT', 'HR', 'FINANCE', 'SDM', 'SDI', 'OTHERS'].includes(deptUpper)) {
+            mappedData.department = deptUpper;
+          } else {
+            mappedData.department = 'OTHERS';
+          }
+        } else {
+          mappedData.department = 'OTHERS';
+        }
 
             // Debug: Log the date being processed
             // // Validate required fields based on your Google Sheet structure
@@ -301,21 +318,30 @@ const bulkUploadJoiners = async (req, res) => {
         // Convert to string and validate phone format - more flexible regex
         const phoneStr = phoneNumber.toString().trim();
         
-        // Remove any non-digit characters except + at the start
-        const cleanedPhone = phoneStr.replace(/[^\d+]/g, '').replace(/^\+/, '');
+        // Remove any non-digit characters except + at the start, then remove + if present
+        let cleanedPhone = phoneStr.replace(/[^\d+]/g, '');
+        if (cleanedPhone.startsWith('+')) {
+          cleanedPhone = cleanedPhone.substring(1);
+        }
         
-        const phoneRegex = /^[\+]?[0-9][\d]{0,15}$/;
-        if (!phoneRegex.test(phoneStr) && cleanedPhone.length < 10) {
-          errors.push(`Row ${i + 1}: Invalid phone format: ${phoneStr} (cleaned: ${cleanedPhone})`);
+        // Validate phone format - must be 10-15 digits
+        const phoneRegex = /^[0-9]{10,15}$/;
+        if (!phoneRegex.test(cleanedPhone)) {
+          errors.push(`Row ${i + 1}: Invalid phone format: ${phoneStr} (cleaned: ${cleanedPhone}). Phone must be 10-15 digits.`);
           continue;
         }
 
         // Update joinerData with the found phone number (use cleaned version if needed)
         joinerData.phone_number = cleanedPhone || phoneStr;
+        
+        // Update mappedData with cleaned phone number
+        mappedData.phone = cleanedPhone || phoneStr;
+        mappedData.phone_number = cleanedPhone || phoneStr;
 
         // Validate role_assign if provided
-        if (joinerData.role_assign && !['SDM', 'SDI', 'SDF', 'OTHER'].includes(joinerData.role_assign)) {
-          errors.push(`Row ${i + 1}: Invalid role_assign value: ${joinerData.role_assign}. Must be one of: SDM, SDI, SDF, OTHER`);
+        if (joinerData.role_assign && joinerData.role_assign.trim() !== '' && 
+            !['SDM', 'SDI', 'SDF', 'SDB', 'OTHER'].includes(joinerData.role_assign.trim())) {
+          errors.push(`Row ${i + 1}: Invalid role_assign value: ${joinerData.role_assign}. Must be one of: SDM, SDI, SDF, SDB, OTHER`);
           continue;
         }
 
@@ -351,7 +377,7 @@ const bulkUploadJoiners = async (req, res) => {
     // Validate data before insertion (optional per-item validation can be re-enabled if needed)
 
     // Insert all valid joiners
-    // let createdJoiners;
+    let createdJoiners;
     try {
       // Test with a single joiner first
       if (processedJoiners.length > 0) {
@@ -359,14 +385,33 @@ const bulkUploadJoiners = async (req, res) => {
         await testJoiner.validate();
       }
       
-      createdJoiners = await Joiner.insertMany(processedJoiners);
+      createdJoiners = await Joiner.insertMany(processedJoiners, { ordered: false });
     } catch (dbError) {
+      // Handle bulk write errors
+      if (dbError.name === 'BulkWriteError' && dbError.writeErrors) {
+        const writeErrors = dbError.writeErrors.map(err => ({
+          index: err.index,
+          error: err.errmsg || err.err.message,
+          data: processedJoiners[err.index]
+        }));
+        
+        return res.status(500).json({
+          message: 'Database insertion failed',
+          insertedCount: dbError.result?.insertedCount || 0,
+          errorCount: writeErrors.length,
+          errors: writeErrors,
+          errorName: dbError.name,
+          errorCode: dbError.code
+        });
+      }
+      
       return res.status(500).json({
         message: 'Database insertion failed',
         error: dbError.message,
         errorName: dbError.name,
         errorCode: dbError.code,
-        details: dbError.toString()
+        details: dbError.toString(),
+        stack: dbError.stack
       });
     }
 
