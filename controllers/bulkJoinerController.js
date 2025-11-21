@@ -189,7 +189,69 @@ const bulkUploadJoiners = async (req, res) => {
     // // Process each joiner data
     const processedJoiners = [];
     const errors = [];
+    
+    // Batch check for existing joiners to improve performance
+    // Collect all emails and author_ids first
+    const emailsToCheck = [];
+    const authorIdsToCheck = [];
+    
+    // First pass: collect all emails and author_ids
+    for (let i = 0; i < joiners_data.length; i++) {
+      const joinerData = joiners_data[i];
+      const email = (joinerData.candidate_personal_mail_id || '').toString().trim().toLowerCase();
+      if (email) emailsToCheck.push(email);
+      
+      // Check for provided author_id
+      let providedAuthorId = null;
+      if (joinerData.author_id !== undefined && joinerData.author_id !== null && joinerData.author_id !== '') {
+        providedAuthorId = String(joinerData.author_id).trim();
+      } else if (joinerData.authorId !== undefined && joinerData.authorId !== null && joinerData.authorId !== '') {
+        providedAuthorId = String(joinerData.authorId).trim();
+      }
+      
+      if (providedAuthorId) {
+        const isValidUUID = (str) => {
+          if (!str || typeof str !== 'string') return false;
+          const trimmed = str.trim();
+          if (trimmed === '') return false;
+          const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+          return uuidRegex.test(trimmed);
+        };
+        if (isValidUUID(providedAuthorId)) {
+          authorIdsToCheck.push(providedAuthorId);
+        }
+      }
+    }
+    
+    // Batch query for existing joiners (only if we have values to check)
+    const existingJoinersByEmail = emailsToCheck.length > 0 
+      ? await Joiner.find({
+          candidate_personal_mail_id: { $in: emailsToCheck }
+        }).select('candidate_personal_mail_id author_id').lean()
+      : [];
+    
+    const existingJoinersByAuthorId = authorIdsToCheck.length > 0
+      ? await Joiner.find({
+          author_id: { $in: authorIdsToCheck }
+        }).select('author_id candidate_personal_mail_id email').lean()
+      : [];
+    
+    // Create lookup maps for O(1) access
+    const existingEmailsMap = new Map();
+    existingJoinersByEmail.forEach(j => {
+      if (j.candidate_personal_mail_id) {
+        existingEmailsMap.set(j.candidate_personal_mail_id.toLowerCase(), j);
+      }
+    });
+    
+    const existingAuthorIdsMap = new Map();
+    existingJoinersByAuthorId.forEach(j => {
+      if (j.author_id) {
+        existingAuthorIdsMap.set(j.author_id, j);
+      }
+    });
 
+    // Second pass: process each joiner with batch-checked duplicates
     for (let i = 0; i < joiners_data.length; i++) {
       try {
         const joinerData = joiners_data[i];
@@ -389,11 +451,8 @@ const bulkUploadJoiners = async (req, res) => {
           continue;
         }
 
-        // Check if joiner already exists
-        // First check by email
-        const existingJoinerByEmail = await Joiner.findOne({
-          candidate_personal_mail_id: mappedData.candidate_personal_mail_id
-        });
+        // Check if joiner already exists (using pre-fetched data)
+        const existingJoinerByEmail = existingEmailsMap.get(mappedData.candidate_personal_mail_id);
         
         if (existingJoinerByEmail) {
           errors.push(`Row ${i + 1}: Joiner with email ${mappedData.candidate_personal_mail_id} already exists (existing author_id: ${existingJoinerByEmail.author_id || 'N/A'})`);
@@ -402,9 +461,7 @@ const bulkUploadJoiners = async (req, res) => {
         
         // Then check by author_id (only if we're using a provided one, not a newly generated one)
         if (providedAuthorId && isValidUUID(providedAuthorId)) {
-          const existingJoinerByAuthorId = await Joiner.findOne({
-            author_id: mappedData.author_id
-          });
+          const existingJoinerByAuthorId = existingAuthorIdsMap.get(mappedData.author_id);
           
           if (existingJoinerByAuthorId) {
             errors.push(`Row ${i + 1}: Joiner with author_id ${mappedData.author_id} already exists (email: ${existingJoinerByAuthorId.candidate_personal_mail_id || existingJoinerByAuthorId.email || 'N/A'})`);
@@ -419,27 +476,38 @@ const bulkUploadJoiners = async (req, res) => {
       }
     }
 
-    if (errors.length > 0) {
+    // If there are errors but also some valid joiners, still insert the valid ones
+    // But return a warning response instead of error
+    if (errors.length > 0 && processedJoiners.length === 0) {
       return res.status(400).json({
-        message: 'Validation errors found',
+        message: 'Validation errors found - no valid joiners to insert',
         errors: errors,
-        processedCount: processedJoiners.length,
+        processedCount: 0,
         totalCount: joiners_data.length
       });
     }
-
-    // Validate data before insertion (optional per-item validation can be re-enabled if needed)
+    
+    // If there are errors but some valid joiners, we'll still insert valid ones
+    // and return success with warnings
+    const hasErrors = errors.length > 0;
 
     // Insert all valid joiners
     let createdJoiners;
     try {
-      // Test with a single joiner first
-      if (processedJoiners.length > 0) {
-        const testJoiner = new Joiner(processedJoiners[0]);
-        await testJoiner.validate();
+      // Use insertMany with ordered: false for better performance
+      // Skip individual validation - Mongoose will validate on insert
+      if (processedJoiners.length === 0) {
+        return res.status(400).json({
+          message: 'No valid joiners to insert after validation',
+          errors: errors,
+          totalCount: joiners_data.length
+        });
       }
       
-      createdJoiners = await Joiner.insertMany(processedJoiners, { ordered: false });
+      createdJoiners = await Joiner.insertMany(processedJoiners, { 
+        ordered: false,
+        rawResult: false
+      });
     } catch (dbError) {
       // Handle bulk write errors
       if (dbError.name === 'BulkWriteError' && dbError.writeErrors) {
@@ -469,10 +537,16 @@ const bulkUploadJoiners = async (req, res) => {
       });
     }
 
-    res.status(201).json({
-      message: 'Bulk upload successful',
+    // Return success even if there were some validation errors (partial success)
+    const statusCode = hasErrors ? 200 : 201;
+    res.status(statusCode).json({
+      message: hasErrors 
+        ? `Bulk upload completed with ${createdJoiners.length} successful and ${errors.length} errors`
+        : 'Bulk upload successful',
       createdCount: createdJoiners.length,
       totalCount: joiners_data.length,
+      errorCount: errors.length,
+      errors: hasErrors ? errors : undefined,
       joiners: createdJoiners
     });
 
